@@ -1,261 +1,478 @@
 import os
 import time
-import sqlite3
+import json
 import hashlib
-from datetime import datetime, timezone, timedelta
-from email.utils import parsedate_to_datetime
+import re
+from datetime import datetime, timezone
 
 import requests
 import feedparser
+from dotenv import load_dotenv
+from bs4 import BeautifulSoup
 
-# =======================
+load_dotenv()
+
+# =========================
 # ENV / CONFIG
-# =======================
-BOT_TOKEN = os.getenv("JOBBOT_TOKEN")
-CHAT_ID = os.getenv("JOBBOT_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
+# =========================
+BOT_TOKEN = os.getenv("JOBBOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("JOBBOT_CHAT_ID", "").strip()
 
-# Freshness windows (minutes)
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 FRESH_CYBER_MIN = int(os.getenv("FRESH_CYBER_MIN", "90"))
 FRESH_IT_MIN = int(os.getenv("FRESH_IT_MIN", "360"))
 
-DB_PATH = os.getenv("SEEN_DB_PATH", "seen.db")
+MAX_CYBER_ALERTS = int(os.getenv("MAX_CYBER_ALERTS", "5"))
+MAX_IT_ALERTS = int(os.getenv("MAX_IT_ALERTS", "3"))
 
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+ENABLE_LINKEDIN = os.getenv("ENABLE_LINKEDIN", "1") == "1"
+ENABLE_RSS = os.getenv("ENABLE_RSS", "1") == "1"
 
-# Two tracks
+# heartbeat to prove Telegram works (minutes)
+HEARTBEAT_MIN = int(os.getenv("HEARTBEAT_MIN", "720"))
+
+# Storage for dedupe (best-effort; persists while container lives)
+STATE_PATH = os.getenv("STATE_PATH", "/tmp/uk_job_sniper_state.json")
+
+UA = os.getenv(
+    "UA",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+)
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Connection": "keep-alive",
+})
+
+# =========================
+# SEARCH TERMS (elite, short list)
+# =========================
 CYBER_TERMS = [
     "SOC Analyst",
     "Security Operations Analyst",
-    "Security Analyst",
-    "Blue Team",
+    "Cyber Security Analyst",
     "Incident Response",
     "Threat Analyst",
-    "Detection Engineer",
-    "SIEM Analyst",
+    "DevSecOps",
 ]
+
 IT_TERMS = [
     "2nd Line Support",
-    "Second Line Support",
-    "Service Desk Engineer",
     "IT Support Engineer",
+    "Service Desk Engineer",
     "IT Engineer",
     "IT Analyst",
-    "Desktop Support",
-    "Support Engineer",
 ]
 
-# Include/exclude (title-based)
-CYBER_INCLUDE = [
-    "soc", "security operations", "security analyst", "blue team",
-    "incident response", "threat", "siem", "detection"
+# =========================
+# SIGNAL FILTERING
+# =========================
+CYBER_POS = [
+    "soc", "security operations", "blue team", "incident", "threat", "siem",
+    "sentinel", "splunk", "defender", "edr", "incident response", "devsecops",
+    "security analyst", "cyber"
 ]
-IT_INCLUDE = [
-    "2nd line", "second line", "service desk", "it support",
-    "desktop support", "support engineer", "it engineer", "it analyst"
-]
-
-EXCLUDE = [
-    "sales", "marketing", "recruiter", "recruitment", "business development",
-    "account manager", "commission", "door to door"
+CYBER_NEG = [
+    "intern", "unpaid", "volunteer", "teacher", "lecturer",
+    "sales", "recruiter", "commission only"
 ]
 
-# Keep it UK-leaning. RSS feeds are UK, but we add a sanity check:
-UK_HINTS = ["uk", "united kingdom", "england", "scotland", "wales", "london", "manchester", "birmingham", "bristol", "cardiff", "leeds", "glasgow", "edinburgh"]
+IT_POS = [
+    "2nd line", "second line", "service desk", "it support", "desktop",
+    "m365", "intune", "azure", "entra", "network", "firewall", "sonicwall",
+    "fortigate", "jamf"
+]
+IT_NEG = [
+    "intern", "unpaid", "volunteer", "sales", "recruiter"
+]
 
-# =======================
-# FEEDS (UK)
-# =======================
-def feeds_for_term(term: str) -> list[str]:
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def minutes_ago(dt: datetime) -> int:
+    return int((now_utc() - dt).total_seconds() / 60)
+
+
+def safe_hash(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:18]
+
+
+def load_state():
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"seen": {}, "last_heartbeat": 0}
+
+
+def save_state(state):
+    try:
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+
+STATE = load_state()
+SEEN = STATE.get("seen", {})  # key -> epoch
+LAST_HEARTBEAT = STATE.get("last_heartbeat", 0)
+
+
+def is_seen(key: str) -> bool:
+    return key in SEEN
+
+
+def mark_seen(key: str):
+    SEEN[key] = int(time.time())
+
+
+def score_text(text: str, pos_list, neg_list) -> int:
+    t = text.lower()
+    score = 0
+    for p in pos_list:
+        if p in t:
+            score += 2
+    for n in neg_list:
+        if n in t:
+            score -= 4
+    return score
+
+
+def send_telegram(message: str) -> bool:
+    if not BOT_TOKEN or not CHAT_ID:
+        print("❌ Telegram not configured (missing JOBBOT_TOKEN / JOBBOT_CHAT_ID)")
+        return False
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False
+    }
+
+    try:
+        r = SESSION.post(url, data=payload, timeout=20)
+        ok = r.status_code == 200
+        if ok:
+            print("✅ Telegram sent")
+        else:
+            print("❌ Telegram error:", r.status_code, r.text[:250])
+        return ok
+    except Exception as e:
+        print("❌ Telegram exception:", e)
+        return False
+
+
+def maybe_heartbeat():
+    global LAST_HEARTBEAT
+    now_ts = int(time.time())
+    if LAST_HEARTBEAT == 0 or (now_ts - LAST_HEARTBEAT) >= HEARTBEAT_MIN * 60:
+        ok = send_telegram(f"🎯 <b>Job Sniper ONLINE</b>\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        if ok:
+            LAST_HEARTBEAT = now_ts
+
+
+# =========================
+# SOURCES (High signal)
+# =========================
+def rss_feeds_for_term(term: str):
     q = term.replace(" ", "+")
-    # Note: boards can be flaky; we stick to the ones you’re already using successfully
+    # NOTE: Some UK boards rate-limit/timeout. We handle failures, not crashes.
     return [
+        # UK job boards (may intermittently block)
         f"https://www.indeed.co.uk/rss?q={q}&l=United+Kingdom&sort=date",
         f"https://www.reed.co.uk/jobs/rss?keywords={q}&location=United+Kingdom",
         f"https://www.totaljobs.com/rss/jobs?q={q}&l=United+Kingdom",
     ]
 
-# =======================
-# DB (persistent dedupe)
-# =======================
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS seen (
-            id TEXT PRIMARY KEY,
-            link TEXT NOT NULL,
-            title TEXT NOT NULL,
-            track TEXT NOT NULL,
-            first_seen_utc TEXT NOT NULL
-        )
-    """)
-    return conn
 
-def seen_id(link: str) -> str:
-    return hashlib.sha256(link.encode("utf-8")).hexdigest()
+def rss_global_cyber():
+    # Global remote cyber: very high hit rate
+    return [
+        "https://remoteok.com/remote-security-jobs.rss",
+        "https://remoteok.com/remote-devops-jobs.rss",
+        "https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss",
+        "https://weworkremotely.com/categories/remote-programming-jobs.rss",
+    ]
 
-def already_seen(conn: sqlite3.Connection, link: str) -> bool:
-    sid = seen_id(link)
-    cur = conn.execute("SELECT 1 FROM seen WHERE id = ?", (sid,))
-    return cur.fetchone() is not None
 
-def mark_seen(conn: sqlite3.Connection, link: str, title: str, track: str):
-    sid = seen_id(link)
-    conn.execute(
-        "INSERT OR IGNORE INTO seen (id, link, title, track, first_seen_utc) VALUES (?, ?, ?, ?, ?)",
-        (sid, link, title, track, datetime.now(timezone.utc).isoformat()),
-    )
-    conn.commit()
+def fetch_feed_entries(url: str):
+    try:
+        resp = SESSION.get(url, timeout=25)
+        content = resp.content
+        feed = feedparser.parse(content)
+        return feed.entries or []
+    except Exception as e:
+        print(f"Feed error: {url} -> {e}")
+        return []
 
-def purge_old(conn: sqlite3.Connection, days: int = 14):
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    conn.execute("DELETE FROM seen WHERE first_seen_utc < ?", (cutoff.isoformat(),))
-    conn.commit()
 
-# =======================
-# UTIL
-# =======================
-def now_utc():
-    return datetime.now(timezone.utc)
-
-def parse_published(entry) -> datetime | None:
-    # RSS entries may have published / updated / etc.
-    for key in ("published", "updated"):
-        if hasattr(entry, key):
+def parse_entry_time(entry) -> datetime:
+    # feedparser gives published_parsed / updated_parsed sometimes
+    for k in ("published_parsed", "updated_parsed"):
+        if hasattr(entry, k) and getattr(entry, k):
             try:
-                dt = parsedate_to_datetime(getattr(entry, key))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt.astimezone(timezone.utc)
+                t = getattr(entry, k)
+                return datetime(*t[:6], tzinfo=timezone.utc)
             except Exception:
                 pass
-    return None
+    # fallback: treat as "now" (won't pass freshness for strict filters if we want)
+    return now_utc()
 
-def minutes_old(dt: datetime | None) -> int | None:
-    if not dt:
-        return None
-    return int((now_utc() - dt).total_seconds() / 60)
 
-def title_ok(title: str, include: list[str]) -> bool:
-    t = title.lower()
-    if any(x in t for x in EXCLUDE):
-        return False
-    return any(x in t for x in include)
+def format_msg(source: str, title: str, link: str, bucket: str, age_min: int, score: int):
+    return (
+        f"🚨 <b>{bucket} Alert</b>\n\n"
+        f"<b>{title}</b>\n"
+        f"🛰 Source: {source}\n"
+        f"🕒 Age: {age_min} min\n"
+        f"📊 Score: {score}\n\n"
+        f"{link}"
+    )
 
-def looks_uk(title: str) -> bool:
-    t = title.lower()
-    return any(h in t for h in UK_HINTS) or True  # feeds are UK-based; keep permissive to avoid false negatives
 
-def score_title(track: str, title: str) -> int:
-    t = title.lower()
-    score = 0
-    if track == "CYBER":
-        if "soc" in t: score += 3
-        if "security operations" in t: score += 3
-        if "incident response" in t: score += 2
-        if "siem" in t: score += 2
-        if "detection" in t: score += 2
-        if "senior" in t or "lead" in t: score -= 2
-    else:
-        if "2nd line" in t or "second line" in t: score += 3
-        if "service desk" in t: score += 2
-        if "it support" in t: score += 2
-        if "support engineer" in t: score += 2
-        if "senior" in t or "lead" in t: score -= 1
-    return score
+# =========================
+# LINKEDIN (guest endpoint, controlled)
+# =========================
+def linkedin_guest_search(term: str, location: str = "United Kingdom", remote_and_hybrid_only: bool = True, limit: int = 25):
+    """
+    Uses LinkedIn guest 'seeMoreJobPostings' endpoint (no login).
+    Remote/hybrid filter: f_WT=2 (remote) and f_WT=3 (hybrid).
+    We keep it gentle to avoid bans.
+    """
+    term_q = requests.utils.quote(term)
+    loc_q = requests.utils.quote(location)
 
-# =======================
-# TELEGRAM
-# =======================
-def send_telegram(text: str):
-    if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("Missing JOBBOT_TOKEN / JOBBOT_CHAT_ID in environment variables")
+    workplace_filters = ""
+    if remote_and_hybrid_only:
+        # include remote + hybrid
+        workplace_filters = "&f_WT=2%2C3"
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False}
-    r = requests.post(url, data=payload, timeout=15)
-    if r.status_code != 200:
-        raise RuntimeError(f"Telegram send failed: {r.status_code} {r.text}")
+    url = (
+        "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search/"
+        f"?keywords={term_q}&location={loc_q}{workplace_filters}&start=0"
+    )
 
-# =======================
-# SCAN
-# =======================
-def scan_track(conn: sqlite3.Connection, track: str, term: str, fresh_min: int, include_keywords: list[str]) -> int:
+    try:
+        resp = SESSION.get(url, timeout=25, headers={
+            "User-Agent": UA,
+            "Accept": "text/html,*/*",
+            "Referer": "https://www.linkedin.com/jobs/",
+        })
+        if resp.status_code != 200:
+            print(f"LinkedIn non-200: {resp.status_code}")
+            return []
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        cards = soup.select("li")
+
+        results = []
+        for li in cards[:limit]:
+            a = li.select_one("a.base-card__full-link")
+            if not a:
+                continue
+
+            title = (a.get_text(strip=True) or "").strip()
+            link = a.get("href", "").strip()
+            if link and link.startswith("/"):
+                link = "https://www.linkedin.com" + link
+
+            # company/location text (helps scoring)
+            meta = li.get_text(" ", strip=True)
+
+            # time tag often present
+            dt = now_utc()
+            time_tag = li.select_one("time")
+            if time_tag and time_tag.has_attr("datetime"):
+                try:
+                    dt = datetime.fromisoformat(time_tag["datetime"].replace("Z", "+00:00"))
+                except Exception:
+                    dt = now_utc()
+
+            results.append({
+                "title": title,
+                "link": link,
+                "meta": meta,
+                "dt": dt,
+                "source": "LinkedIn",
+            })
+
+        return results
+
+    except Exception as e:
+        print(f"LinkedIn error: {e}")
+        return []
+
+
+# =========================
+# CORE SCAN
+# =========================
+def scan_bucket(bucket_name: str, terms, fresh_min: int, pos_list, neg_list, max_alerts: int, include_rss: bool, include_linkedin: bool, include_global: bool = False):
     sent = 0
-    feed_urls = feeds_for_term(term)
 
-    for feed_url in feed_urls:
-        try:
-            resp = requests.get(feed_url, headers=HEADERS, timeout=15)
-            feed = feedparser.parse(resp.content)
-            entries = getattr(feed, "entries", []) or []
-            print(f"[{datetime.now()}] {track} term='{term}' feed={feed_url} entries={len(entries)}")
+    for term in terms:
+        if sent >= max_alerts:
+            break
 
-            for entry in entries[:20]:
-                title = getattr(entry, "title", "").strip()
-                link = getattr(entry, "link", "").strip()
-                if not title or not link:
+        # --- Global remote cyber sources (only for cyber bucket)
+        if include_global and bucket_name == "CYBER":
+            for url in rss_global_cyber():
+                if sent >= max_alerts:
+                    break
+
+                entries = fetch_feed_entries(url)
+                for e in entries[:20]:
+                    if sent >= max_alerts:
+                        break
+
+                    title = getattr(e, "title", "") or ""
+                    link = getattr(e, "link", "") or ""
+                    dt = parse_entry_time(e)
+                    age = minutes_ago(dt)
+
+                    text_for_score = f"{title} {getattr(e, 'summary', '')}"
+                    score = score_text(text_for_score, pos_list, neg_list)
+
+                    # strict: must be fresh enough + score >= 2
+                    if age > fresh_min:
+                        continue
+                    if score < 2:
+                        continue
+
+                    key = safe_hash(f"{url}|{link}|{title}")
+                    if is_seen(key):
+                        continue
+
+                    msg = format_msg("Global Remote", title, link, bucket_name, age, score)
+                    if send_telegram(msg):
+                        mark_seen(key)
+                        sent += 1
+
+        # --- RSS UK feeds (best effort)
+        if include_rss:
+            for url in rss_feeds_for_term(term):
+                if sent >= max_alerts:
+                    break
+
+                entries = fetch_feed_entries(url)
+                print(f"{bucket_name} term='{term}' feed={url} entries={len(entries)}")
+
+                for e in entries[:15]:
+                    if sent >= max_alerts:
+                        break
+
+                    title = getattr(e, "title", "") or ""
+                    link = getattr(e, "link", "") or ""
+                    dt = parse_entry_time(e)
+                    age = minutes_ago(dt)
+
+                    text_for_score = f"{title} {getattr(e, 'summary', '')}"
+                    score = score_text(text_for_score, pos_list, neg_list)
+
+                    if age > fresh_min:
+                        continue
+                    if score < 2:
+                        continue
+
+                    key = safe_hash(f"{url}|{link}|{title}")
+                    if is_seen(key):
+                        continue
+
+                    msg = format_msg("UK RSS", title, link, bucket_name, age, score)
+                    if send_telegram(msg):
+                        mark_seen(key)
+                        sent += 1
+
+        # --- LinkedIn (UK + remote/hybrid)
+        if include_linkedin and ENABLE_LINKEDIN:
+            # gentle spacing between LinkedIn hits
+            time.sleep(2)
+
+            results = linkedin_guest_search(term, location="United Kingdom", remote_and_hybrid_only=True, limit=25)
+            print(f"{bucket_name} LinkedIn term='{term}' results={len(results)}")
+
+            for r in results:
+                if sent >= max_alerts:
+                    break
+
+                title = r["title"]
+                link = r["link"]
+                meta = r["meta"]
+                dt = r["dt"]
+                age = minutes_ago(dt)
+
+                score = score_text(f"{title} {meta}", pos_list, neg_list)
+
+                # LinkedIn timestamps can be missing → be stricter with score if age is unknown-ish
+                if age > fresh_min:
+                    continue
+                if score < 3:
                     continue
 
-                if not looks_uk(title):
+                key = safe_hash(f"linkedin|{link}|{title}")
+                if is_seen(key):
                     continue
 
-                if not title_ok(title, include_keywords):
-                    continue
-
-                pub = parse_published(entry)
-                age = minutes_old(pub)
-
-                # If feed provides timestamps, enforce freshness.
-                # If not, allow but score lower by skipping if too many false positives happen later.
-                if age is not None and age > fresh_min:
-                    continue
-
-                if already_seen(conn, link):
-                    continue
-
-                score = score_title(track, title)
-                mark_seen(conn, link, title, track)
-
-                age_txt = f"{age}m" if age is not None else "unknown age"
-                msg = (
-                    f"🎯 <b>{track} SNIPER</b>\n"
-                    f"<b>{title}</b>\n"
-                    f"Score: {score} | Age: {age_txt}\n\n"
-                    f"{link}"
-                )
-                send_telegram(msg)
-                sent += 1
-
-        except Exception as e:
-            print(f"[{datetime.now()}] Feed error: {feed_url} -> {e}")
+                msg = format_msg("LinkedIn UK (Remote/Hybrid)", title, link, bucket_name, age, score)
+                if send_telegram(msg):
+                    mark_seen(key)
+                    sent += 1
 
     return sent
 
-def main():
-    print(f"[{datetime.now()}] ✅ Job Sniper starting. Interval={CHECK_INTERVAL}s")
-    conn = db()
-    purge_old(conn, days=14)
 
-    # Startup heartbeat
-    try:
-        send_telegram(f"✅ Job Sniper LIVE\nInterval: {CHECK_INTERVAL}s\nCyber fresh: {FRESH_CYBER_MIN}m | IT fresh: {FRESH_IT_MIN}m")
-    except Exception as e:
-        print(f"[{datetime.now()}] Telegram startup failed: {e}")
+def main():
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🇬🇧 Job Sniper starting. Interval={CHECK_INTERVAL}s")
+    maybe_heartbeat()
 
     while True:
-        cycle_sent = 0
+        try:
+            cycle_start = datetime.now().strftime("%H:%M:%S")
+            print(f"\n=== Cycle {cycle_start} ===")
 
-        # CYBER
-        for term in CYBER_TERMS:
-            cycle_sent += scan_track(conn, "CYBER", term, FRESH_CYBER_MIN, CYBER_INCLUDE)
+            cyber_sent = scan_bucket(
+                bucket_name="CYBER",
+                terms=CYBER_TERMS,
+                fresh_min=FRESH_CYBER_MIN,
+                pos_list=CYBER_POS,
+                neg_list=CYBER_NEG,
+                max_alerts=MAX_CYBER_ALERTS,
+                include_rss=ENABLE_RSS,
+                include_linkedin=True,
+                include_global=True,   # global remote cyber ON
+            )
 
-        # IT
-        for term in IT_TERMS:
-            cycle_sent += scan_track(conn, "IT", term, FRESH_IT_MIN, IT_INCLUDE)
+            it_sent = scan_bucket(
+                bucket_name="IT",
+                terms=IT_TERMS,
+                fresh_min=FRESH_IT_MIN,
+                pos_list=IT_POS,
+                neg_list=IT_NEG,
+                max_alerts=MAX_IT_ALERTS,
+                include_rss=ENABLE_RSS,
+                include_linkedin=True,
+                include_global=False,
+            )
 
-        print(f"[{datetime.now()}] Cycle complete. Sent={cycle_sent}. Sleeping...\n")
+            print(f"Cycle complete. Sent: CYBER={cyber_sent}, IT={it_sent}")
+
+            # persist state
+            STATE["seen"] = SEEN
+            STATE["last_heartbeat"] = LAST_HEARTBEAT
+            save_state(STATE)
+
+        except Exception as e:
+            print("Fatal cycle error:", e)
+
         time.sleep(CHECK_INTERVAL)
+
 
 if __name__ == "__main__":
     main()
