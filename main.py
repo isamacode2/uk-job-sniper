@@ -3,13 +3,10 @@ import feedparser
 import time
 import os
 from datetime import datetime
-from dotenv import load_dotenv
-
-load_dotenv()
 
 BOT_TOKEN = os.getenv("JOBBOT_TOKEN")
 CHAT_ID = os.getenv("JOBBOT_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 120))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))
 
 SEARCH_TERMS = [
     "SOC Analyst UK",
@@ -21,80 +18,60 @@ SEARCH_TERMS = [
 
 seen_links = set()
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-}
-
 
 def send_telegram(message):
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram credentials missing")
-        return
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    }
-
     try:
-        requests.post(url, data=payload, timeout=15)
-        print("Sent")
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        requests.post(url, data=payload, timeout=10)
     except Exception as e:
         print("Telegram error:", e)
 
 
-def get_feeds(term):
+def get_feed(term):
     query = term.replace(" ", "+")
-    return [
-        f"https://www.indeed.co.uk/rss?q={query}&sort=date",
-        f"https://www.reed.co.uk/jobs/rss?keywords={query}",
-        f"https://remoteok.com/remote-security-jobs.rss"
-    ]
+    return f"https://www.indeed.co.uk/rss?q={query}&l=United+Kingdom&sort=date"
 
 
 def scan_term(term):
-    feeds = get_feeds(term)
+    feed_url = get_feed(term)
 
-    for feed_url in feeds:
-        try:
-            response = requests.get(feed_url, headers=HEADERS, timeout=15)
-            feed = feedparser.parse(response.content)
+    try:
+        feed = feedparser.parse(feed_url)
 
-            for entry in feed.entries[:5]:
-                title = entry.title
-                link = entry.link
+        for entry in feed.entries[:10]:
+            title = entry.title
+            link = entry.link
 
-                if "United Kingdom" not in title and "UK" not in title:
-                    continue
+            if link not in seen_links:
+                seen_links.add(link)
 
-                if link not in seen_links:
-                    seen_links.add(link)
+                message = (
+                    f"🚨 <b>UK Job Alert</b>\n\n"
+                    f"<b>{title}</b>\n"
+                    f"🎯 {term}\n\n"
+                    f"{link}"
+                )
 
-                    message = (
-                        f"🚨 <b>UK Job Alert</b>\n\n"
-                        f"<b>{title}</b>\n"
-                        f"🎯 {term}\n\n"
-                        f"{link}"
-                    )
+                send_telegram(message)
 
-                    send_telegram(message)
-
-        except Exception as e:
-            print("Feed error:", feed_url, e)
+    except Exception as e:
+        print("Feed error:", e)
 
 
 def main():
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🇬🇧 UK Job Sniper LIVE")
+    print("🇬🇧 UK Job Sniper Running")
 
     while True:
         for term in SEARCH_TERMS:
             print("Scanning:", term)
             scan_term(term)
 
-        print("Cycle complete\n")
+        print("Sleeping...\n")
         time.sleep(CHECK_INTERVAL)
 
 
