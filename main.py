@@ -3,6 +3,7 @@ import time
 import json
 import hashlib
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import requests
 import feedparser
@@ -21,7 +22,8 @@ FRESH_IT_MIN = int(os.getenv("FRESH_IT_MIN", "360"))
 MAX_CYBER_ALERTS = 5
 MAX_IT_ALERTS = 4
 
-STATE_PATH = "/tmp/uk_job_sniper_state.json"
+# IMPORTANT: change this so Railway restarts don’t wipe memory
+STATE_PATH = "/app/uk_job_sniper_state.json"
 
 UA = "Mozilla/5.0"
 SESSION = requests.Session()
@@ -53,7 +55,7 @@ IT_POS = ["2nd line", "service desk", "it support", "azure", "intune", "network"
 IT_NEG = ["intern", "sales", "recruiter"]
 
 # =========================
-# TIME HELPERS (FIXED)
+# TIME HELPERS
 # =========================
 def now_utc():
     return datetime.now(timezone.utc)
@@ -89,6 +91,28 @@ def is_seen(key):
 
 def mark_seen(key):
     SEEN[key] = int(time.time())
+
+# =========================
+# DEDUPE NORMALIZER (FIX)
+# =========================
+def normalize_link(link):
+    if not link:
+        return ""
+
+    # Remove query parameters (kills LinkedIn tracking duplicates)
+    parsed = urlparse(link)
+    clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+    # Extract LinkedIn job ID
+    if "linkedin.com/jobs/view/" in clean:
+        job_id = clean.rstrip("/").split("/")[-1]
+        return f"linkedin:{job_id}"
+
+    return clean
+
+def build_key(link):
+    normalized = normalize_link(link)
+    return hashlib.sha256(normalized.encode()).hexdigest()
 
 # =========================
 # UTILS
@@ -179,7 +203,7 @@ def linkedin_search(term):
 def scan(bucket, terms, fresh_min, pos, neg, max_alerts):
     sent = 0
     for term in terms:
-        # RSS (strict)
+        # RSS
         for url in rss_feeds(term):
             for e in fetch_feed(url)[:15]:
                 title = getattr(e, "title", "")
@@ -188,12 +212,10 @@ def scan(bucket, terms, fresh_min, pos, neg, max_alerts):
                 age = minutes_ago(dt)
                 score = score_text(title, pos, neg)
 
-                if age > fresh_min:
-                    continue
-                if score < 3:
+                if age > fresh_min or score < 3:
                     continue
 
-                key = hashlib.sha256(link.encode()).hexdigest()
+                key = build_key(link)
                 if is_seen(key):
                     continue
 
@@ -202,9 +224,8 @@ def scan(bucket, terms, fresh_min, pos, neg, max_alerts):
                     mark_seen(key)
                     sent += 1
 
-        # LinkedIn (balanced logic)
-        results = linkedin_search(term)
-        for r in results:
+        # LinkedIn
+        for r in linkedin_search(term):
             title = r["title"]
             link = r["link"]
             dt = r["dt"]
@@ -214,14 +235,12 @@ def scan(bucket, terms, fresh_min, pos, neg, max_alerts):
             if age > fresh_min:
                 continue
 
-            if bucket == "CYBER":
-                if score < 3:
-                    continue
-            else:
-                if score < 2:
-                    continue
+            if bucket == "CYBER" and score < 3:
+                continue
+            if bucket == "IT" and score < 2:
+                continue
 
-            key = hashlib.sha256(link.encode()).hexdigest()
+            key = build_key(link)
             if is_seen(key):
                 continue
 
